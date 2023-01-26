@@ -1,0 +1,90 @@
+let block_list = dynamic(["deny","drop","block","Blocked","dropped"]);
+let HAS_ANY_MAX = 10000;
+let dt_lookBack = 1h;
+let ioc_lookBack = 14d;
+let BASE_TI= materialize(ThreatIntelligenceIndicator
+| where TimeGenerated >= ago(ioc_lookBack) and ExpirationDateTime > now()
+| summarize LatestIndicatorTime = arg_max(TimeGenerated, *) by IndicatorId
+| where Active == true);
+let DOMAIN_TI_list= todynamic(toscalar(BASE_TI | where isnotempty(DomainName) | summarize NIoCs = dcount(DomainName), Domains = make_set(DomainName) 
+  | project Domains=iff(NIoCs > HAS_ANY_MAX, dynamic([]), Domains) ));
+let IP_TI_list= todynamic(toscalar(BASE_TI | where isnotempty(NetworkIP) | summarize NIoCs = dcount(NetworkIP), IPs = make_set(NetworkIP) 
+  | project IPs=iff(NIoCs > HAS_ANY_MAX, dynamic([]), IPs) ));
+let URL_TI_list= todynamic(toscalar(BASE_TI | where isnotempty(Url) | summarize NIoCs = dcount(Url), Urls = make_set(Url) 
+  | project Urls=iff(NIoCs > HAS_ANY_MAX, dynamic([]), Urls) ));
+( union isfuzzy=true
+    (BASE_TI   //dns
+    | join kind=innerunique ( 
+        ( union isfuzzy=true
+        ( CommonSecurityLog 
+            | where TimeGenerated > ago(dt_lookBack) and not(DeviceAction has_any (block_list))
+            | where isnotempty(DestinationHostName) and DestinationHostName has_any(DOMAIN_TI_list)
+            | extend domain = DestinationHostName,
+                   tld = tostring(split(DestinationHostName, '.')[-1]),
+                   Event_TimeGenerated = TimeGenerated
+        ),
+      (EmailUrlInfo
+           | where TimeGenerated > ago(dt_lookBack)
+           | where UrlDomain has_any(DOMAIN_TI_list)
+           | extend domain = UrlDomain,
+                 tld = tostring(split(UrlDomain, '.')[-1]),
+                 Event_TimeGenerated = TimeGenerated
+         ),
+         (DeviceNetworkEvents
+            | where TimeGenerated > ago(dt_lookBack)
+            | where isnotempty(RemoteUrl) and RemoteUrl has_any(DOMAIN_TI_list)
+            | extend domain = RemoteUrl,
+                   tld = tostring(split(RemoteUrl, '.')[-1]),
+                   Event_TimeGenerated = TimeGenerated
+         )
+        )
+    ) on $left.DomainName==$right.domain
+    | where Event_TimeGenerated < ExpirationDateTime
+    | summarize Event_TimeGenerated  = arg_max(Event_TimeGenerated , *) by IndicatorId, domain
+    ),
+    (BASE_TI   //url
+    | join kind=innerunique ( 
+        ( union isfuzzy=true
+        ( CommonSecurityLog 
+            | where TimeGenerated > ago(dt_lookBack) and not(DeviceAction has_any (block_list))
+            | where isnotempty(RequestUrl) and RequestURL has_any(URL_TI_list)
+            | extend Url = RequestURL,
+                   tld = tostring(split(DestinationHostName, '.')[-1]),
+                   Event_TimeGenerated = TimeGenerated
+        ),
+        (EmailUrlInfo 
+           | where TimeGenerated > ago(dt_lookBack)
+           | where Url has_any(URL_TI_list)
+           | extend Event_TimeGenerated = TimeGenerated
+        ),
+        (UrlClickEvents
+           | where TimeGenerated > ago(dt_lookBack) and ActionType == "ClickAllowed"
+           | where Url has_any(URL_TI_list)
+           | extend Event_TimeGenerated = TimeGenerated
+        )
+        )
+    ) on Url
+    | where Event_TimeGenerated < ExpirationDateTime
+    | summarize Event_TimeGenerated  = arg_max(Event_TimeGenerated , *) by IndicatorId, Url
+    ),
+    (BASE_TI   //ip
+    | join kind=innerunique ( 
+        ( union isfuzzy=true
+        ( CommonSecurityLog 
+            | where TimeGenerated > ago(dt_lookBack) and not(DeviceAction has_any (block_list))
+            | where DestinationIP has_any(IP_TI_list)
+            | extend NetworkIP = DestinationIP,
+                   Event_TimeGenerated = TimeGenerated
+        ),
+      (DeviceNetworkEvents
+           | where TimeGenerated > ago(dt_lookBack)
+           | where RemoteIP has_any(IP_TI_list)
+           | extend NetworkIP = RemoteIP,
+                 Event_TimeGenerated = TimeGenerated
+         )
+        )
+    ) on NetworkIP
+    | where Event_TimeGenerated < ExpirationDateTime
+    | summarize Event_TimeGenerated  = arg_max(Event_TimeGenerated , *) by IndicatorId, NetworkIP
+    )
+)

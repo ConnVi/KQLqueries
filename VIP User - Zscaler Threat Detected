@@ -1,0 +1,58 @@
+let ["VIP Users"] =  IdentityInfo
+| where TimeGenerated > ago(90d) and (GroupMembership has "Department-Executive Management"
+                                or OnPremisesDistinguishedName has "OU=Partners"
+                                or AssignedRoles has_any ("Exchange Administrator",
+		                                                "Exchange Recipient Administrator",
+                                                        "User Administrator",
+                                                        "Privileged Role Administrator",
+                                                        "Password Administrator",
+                                                        "Global Administrator"
+                                                        )
+                                    )
+| distinct AccountUPN, OnPremisesDistinguishedName;
+let VIPcheck = ['VIP Users'] | project AccountUPN;
+let URLExceptions = _GetWatchlist("zscaler_exceptions")
+    | where Type == "URL"
+    | project Value;
+let DomainExceptions = _GetWatchlist("zscaler_exceptions")
+    | where Type == "Domain"
+    | project Value;
+let CategoryExceptions = _GetWatchlist("zscaler_exceptions")
+    | where Type == "Category"
+    | project Value;
+CommonSecurityLog
+| where DeviceVendor == "Zscaler"
+        and DeviceCustomString5Label == "threatname" 
+        and DeviceCustomString5 != "None" 
+        and DeviceCustomString5 != "suspiciousfile" 
+        and SourceUserName in~ (VIPcheck)
+| parse AdditionalExtensions with "cat=" zCategory ";outcome=" RequestOutcome ";" fullURL "reason=" AdditionalExtensions "devicehostname=" deviceHostname
+//| where zCategory !in ("social networking", "Corporate Marketing", "Adware/Spyware Sites", "audio streaming", "Professional Services", "Blogs")
+//| where zCategory != "Cross-site Scripting" and DeviceEventClassID == "Blocked"
+| where DeviceEventClassID == "Blocked"
+| extend
+    RequestURL = replace("=;", "=", case(RequestURL == "", RequestURL = fullURL, RequestURL = RequestURL)),
+    RiskScore = DeviceCustomNumber1
+| extend RequestURL = case(RequestURL endswith ";", tostring(split(RequestURL, ";")[0]), RequestURL)
+| extend AlertDescription = strcat("A web request sent from user ", SourceUserName, " was classified as a possible threat: ", zCategory ,". Zscaler ", DeviceEventClassID," this request. Reasoning: ", Activity," Zscaler threat library - https://threatlibrary.zscaler.com/")
+| where RiskScore != "0"
+| where RequestURL !in (URLExceptions)
+| where DestinationHostName !in (DomainExceptions)
+| where zCategory !in (CategoryExceptions)
+| project
+    TimeGenerated,
+    Threatname = DeviceCustomString5,
+    zCategory,
+    Action = DeviceEventClassID,
+    Activity,
+    AlertDescription,
+    SourceUserName,
+    deviceHostname,
+    DestinationHostName,
+    SourceIP,
+    DestinationIP,
+    RequestURL,
+    RequestMethod,
+    RequestContext,
+    RequestOutcome,
+    RiskScore
